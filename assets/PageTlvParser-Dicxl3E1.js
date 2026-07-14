@@ -1,0 +1,1 @@
+import"./i18n-UkYQ0Akr.js";import"./compts-Cw3vn0Pa.js";import{a as e}from"./pages-DVOaoJfT.js";export{e as default};

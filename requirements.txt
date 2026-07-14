@@ -1,0 +1,2 @@
+bleak>=0.21
+textual>=0.60   # only needed for beesim_tui.py
