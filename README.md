@@ -2,10 +2,11 @@
 
 Pure-Bluetooth control for **BeeSIM eUICC cards**, reverse-engineered from the
 official web LPA at `https://beeesim.com/ble/` (build *"BeeSIM Web v2.1.4"*).
-Enable / disable / delete / rename eSIM profiles, read the EID & card info,
-manage notifications, and set the card's BLE TX power — all over BLE, no
-network. Ships with a CLI and a Textual terminal UI (with a live signal-strength
-readout) in a single file.
+Download, enable, disable, delete and rename eSIM profiles, read the EID & card
+info, manage notifications, and set the card's BLE TX power. Profile management
+is all over BLE; downloading a new profile additionally talks to the operator's
+SM-DP+ (unavoidable in GSMA RSP). Ships with a CLI and a Textual terminal UI
+(with a live signal-strength readout) in a single file.
 
 ## Install
 
@@ -25,6 +26,7 @@ python beesim.py disable <iccid>
 python beesim.py rename  <iccid> "Work SIM"
 python beesim.py eid
 python beesim.py txpower 4              # set BLE TX power (0=min .. 4=max)
+python beesim.py download "LPA:1$rsp.example.com$MATCHING-ID"   # download an eSIM
 python beesim.py --help                # full command list
 ```
 
@@ -33,12 +35,13 @@ python beesim.py --help                # full command list
 `python beesim.py` (or `python beesim.py tui`) opens the TUI:
 
 - **sidebar** — connection status, **live RSSI** (BLE signal strength), EID,
-  Scan/Connect, Refresh, Enable/Disable/Delete/Rename, **TX Power**, Reset card
+  Scan/Connect, Refresh, **Download eSIM**, Enable/Disable/Delete/Rename,
+  **TX Power**, Reset card
 - **table** — profiles with live ON/OFF state
-- **log** — actions and APDU traffic
-- **keys** — `s` scan · `r` refresh · `e`/`d` enable/disable · `x` delete ·
-  `n` rename · `i` info · `N` notifications · `t` TX power · `a` raw APDU ·
-  `c` disconnect · `q` quit
+- **log** — actions, download progress, and APDU traffic
+- **keys** — `s` scan · `r` refresh · `o` download · `e`/`d` enable/disable ·
+  `x` delete · `n` rename · `i` info · `N` notifications · `t` TX power ·
+  `a` raw APDU · `c` disconnect · `q` quit
 
 The RSSI readout polls the **connected link** every ~2 s (via the platform
 backend — CoreBluetooth on macOS, BlueZ on Linux). BeeSIM cards stop advertising
@@ -293,21 +296,43 @@ e.g. `89014103...` is stored/sent as `98104130...`.
 
 ---
 
-## 4. eSIM download (LPA) flow — reference only, NOT implemented
+## 4. eSIM download (LPA) flow — implemented
 
-Downloading a *new* profile is intentionally **out of scope**: `beesim.py` is
-pure BLE with no network traffic. This is inherent to GSMA RSP — the profile
-lives on the operator's SM-DP+ server and cannot be obtained without an online
-handshake, so it isn't "controlling the card over BLE".
+`download_profile()` (CLI `download`, TUI *Download eSIM* / `o`) does a full GSMA
+SGP.22 download: **ES10b card commands over BLE** interleaved with **ES9+ server
+commands sent straight to the operator's SM-DP+** (no proxy). Downloading a new
+profile inherently needs that SM-DP+ dialogue — the profile lives on the server;
+the card supplies the crypto.
 
-For reference, the web app does it by proxying ES9+ through beeesim's backend
-(`POST https://beeesim.com/fetch/v2/plugin/esim/rsp/es9plus/execute.do?action=…`,
-actions `initiateAuthentication` / `authenticateClient` / `getBoundProfilePackage`
-/ `handleNotification`), interleaved with the ES10b card commands
-`GetEUICCChallenge → AuthenticateServer → PrepareDownload →
-LoadBoundProfilePackage → RemoveNotificationFromList`. The ES10b card-side
-building blocks (`get_euicc_challenge`, `store_and_read`, `store_bytes`,
-`get_response`) remain in `beesim.py` if you ever want to build a downloader.
+```
+[1] ES10b GetEUICCChallenge + GetEUICCInfo1        (BLE)
+[2] ES9+  initiateAuthentication                   → SM-DP+
+[3] ES10b AuthenticateServer  (BF38)               (BLE)   ← eUICC verifies the SM-DP+ cert chain to the GSMA CI
+[4] ES9+  authenticateClient                       → SM-DP+ (returns profileMetadata)
+[5] ES10b PrepareDownload     (BF21, +hashCc if a confirmation code)   (BLE)
+[6] ES9+  getBoundProfilePackage                   → SM-DP+
+[7] ES10b LoadBoundProfilePackage: BPP split into ES8+ STORE DATA blocks (BLE)
+```
+
+ES9+ endpoints are `POST https://<smdp>/gsma/rsp2/es9plus/<function>` with headers
+`X-Admin-Protocol: gsma/rsp/v2.2.0`, `User-Agent: gsma-rsp-lpad`. The profile
+installs **disabled**; enable it with `enable <iccid>`. Confirmation-code profiles:
+pass `--confirm-code`. Activation codes are `LPA:1$<smdp>$<matchingId>[$<oid>][$<ccRequired>]`.
+
+**TLS to the SM-DP+ is intentionally not web-PKI-verified.** GSMA RSP has its own
+end-to-end mutual authentication in the *payload*: the eUICC checks the SM-DP+
+certificate chain up to the GSMA CI and every signature (a forged server fails
+step 3, AuthenticateServer), and the SM-DP+ verifies the eUICC. TLS is only
+transport confidentiality here, and SM-DP+ certs are signed by the **GSMA RSP2
+Root CI1** (the eSIM PKI root, key id `81370F…` — the same CI your card trusts),
+not a public web CA. So `beesim.py` skips the web-PKI check rather than shipping
+or downloading a CA bundle; forging a profile over a TLS MITM is still impossible.
+
+> Verified end-to-end on real hardware: a **BetterRoaming** GSMA-test profile
+> (`LPA:1$rsp.truphone.com$QRF-BETTERROAMING-…`) downloaded and installed over BLE.
+> Public free test profiles come and go — expect server-side `matching ID refused`
+> / `campaign pool empty` on depleted ones (the download stack is fine; the pool
+> isn't). See <https://euicc-manual.osmocom.org/docs/rsp/known-test-profile/>.
 
 ---
 
@@ -364,7 +389,7 @@ APDUs — it could not be exercised, and nothing is wired in.
 
 | File | What |
 |------|------|
-| `beesim.py` | single-file pure-BLE controller: transport + eUICC + ES10 + CLI + Textual TUI |
+| `beesim.py` | single-file controller: BLE transport + eUICC + ES10 + eSIM download + CLI + Textual TUI |
 | `README.md` | this document |
 | `requirements.txt` | `bleak` (+ `textual` for the TUI) |
 | `assets/`, `src/` | the downloaded web-app sources (raw JS chunks) |

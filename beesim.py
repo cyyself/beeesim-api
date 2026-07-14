@@ -39,6 +39,7 @@ USAGE:
   python beesim.py reset
   python beesim.py txpower  <0-4>                  # set BLE TX power (0=min, 4=max)
   python beesim.py notifications
+  python beesim.py download "LPA:1$smdp$matchingId"   # download an eSIM profile
   python beesim.py apdu     A03F0000 00           # send a raw hex APDU (advanced)
 
 The TUI (Textual) is optional: `pip install textual`. The CLI works with bleak
@@ -50,8 +51,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
+import ssl
 import sys
+import urllib.request
 from typing import List, Optional, Tuple
 
 try:
@@ -578,6 +582,176 @@ async def read_rssi(client) -> Optional[int]:
 
 
 # --------------------------------------------------------------------------- #
+# eSIM download (GSMA SGP.22): ES9+ to the SM-DP+ (HTTPS) + ES10b over BLE
+#
+# TLS to the SM-DP+ is intentionally NOT web-PKI-verified. GSMA RSP already
+# provides end-to-end mutual authentication at the payload layer: the eUICC
+# verifies the SM-DP+ certificate chain up to the GSMA CI and checks every
+# signature (a forged server fails ES10b AuthenticateServer), and the SM-DP+
+# verifies the eUICC. TLS is only transport confidentiality, and the SM-DP+
+# cert is signed by the GSMA eSIM root (not a public CA) anyway — so we skip
+# cert checks and rely on the RSP crypto rather than shipping/downloading a CA.
+# --------------------------------------------------------------------------- #
+RSP_PROTOCOL = "gsma/rsp/v2.2.0"
+_ES9_SSL = ssl._create_unverified_context()
+
+
+def parse_activation_code(code: str) -> Tuple[str, str, bool]:
+    """LPA:1$<smdp>$<matchingId>[$<oid>][$<ccRequired>] -> (smdp, matchingId, ccRequired)."""
+    code = code.strip()
+    if code.upper().startswith("LPA:"):
+        code = code[4:]
+    p = code.split("$")
+    if len(p) < 3 or p[0] != "1":
+        raise ValueError("bad activation code; expected LPA:1$smdp$matchingId")
+    return p[1], p[2], (len(p) > 4 and p[4] == "1")
+
+
+def _es9p(smdp: str, function: str, payload: dict) -> dict:
+    """POST an ES9+ function directly to the SM-DP+ and return the JSON body."""
+    req = urllib.request.Request(
+        f"https://{smdp}/gsma/rsp2/es9plus/{function}",
+        data=json.dumps(payload).encode(), method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "X-Admin-Protocol": RSP_PROTOCOL, "User-Agent": "gsma-rsp-lpad"})
+    with urllib.request.urlopen(req, timeout=40, context=_ES9_SSL) as r:
+        j = json.loads(r.read().decode())
+    st = (j.get("header") or {}).get("functionExecutionStatus") or {}
+    if st.get("status") not in (None, "Executed-Success"):
+        rc = st.get("statusCodeData") or {}
+        raise RuntimeError(f"ES9+ {function}: {st.get('status')} "
+                           f"{rc.get('subjectCode','')}/{rc.get('reasonCode','')} "
+                           f"{rc.get('message','')}".strip())
+    return j
+
+
+def _response_error(resp: bytes, root_tag: str) -> Optional[str]:
+    """Return the error code of a top-level A1 (…ResponseError) in a BFxx response,
+    or None. Only inspects DIRECT children (the A0 ok-branch nests its own A1s)."""
+    nodes = parse_tlv(resp)
+    if not nodes or nodes[0]["tag"] != root_tag or not isinstance(nodes[0]["value"], list):
+        return None
+    a1 = next((c for c in nodes[0]["value"] if c["tag"] == "A1"), None)
+    if a1 is None:
+        return None
+    if isinstance(a1["value"], list):
+        for c in a1["value"]:
+            if c["tag"] == "02":
+                return b2h(c["value"])
+    return "??"
+
+
+def _bpp_to_blocks(bpp: bytes) -> List[bytes]:
+    """Segment a BoundProfilePackage into ES8+ STORE DATA blocks (SGP.22 §5.5.4)."""
+    outer = parse_tlv(bpp)[0]
+    hdr = outer["tag"] + der_len(outer["length"]).hex().upper()
+    blocks: List[bytes] = []
+    for seg in outer["value"]:
+        tag = seg["tag"]
+        if tag == "BF23":
+            blocks.append(h2b(hdr + serialize_tlv(seg)))
+        elif tag in ("A0", "A2"):
+            blocks.append(h2b(serialize_tlv(seg)))
+        elif tag in ("A1", "A3"):
+            blocks.append(h2b(seg["tag"] + der_len(seg["length"]).hex().upper()))
+            for child in seg["value"]:
+                blocks.append(h2b(serialize_tlv(child)))
+    return blocks
+
+
+def _profile_meta(meta: bytes) -> dict:
+    """Decode StoreMetadataRequest (BF25) enough to name the profile."""
+    nodes = parse_tlv(meta)
+    out = {}
+    iccid = find_tag(nodes, "BF25", "5A") or find_tag(nodes, "5A")
+    if iccid:
+        out["iccid"] = swap_nibbles(b2h(iccid)).rstrip("F")
+    for tag, key in (("92", "profileName"), ("91", "serviceProviderName")):
+        v = find_tag(nodes, "BF25", tag) or find_tag(nodes, tag)
+        if v:
+            out[key] = bytes(v).decode("utf-8", "replace")
+    return out
+
+
+async def download_profile(sim: "BeeSim", euicc: "Euicc", smdp: str, matching_id: str = "",
+                           confirm_code: Optional[str] = None, log=print) -> dict:
+    """Download+install an eSIM profile onto a connected card (installs disabled).
+    Runs ES10b over BLE (via sim/euicc) and ES9+ straight to the SM-DP+. Returns
+    the installed profile dict; raises on failure."""
+    b64e = lambda x: base64.b64encode(x).decode()
+    b64d = base64.b64decode
+
+    log(f"SM-DP+ {smdp}  /  matching-id {matching_id or '(none)'}")
+    await euicc.init()
+
+    log("[1/7] ES10b GetEUICCChallenge / Info1")
+    challenge = await sim.get_euicc_challenge()
+    info1 = await euicc.store_and_read(h2b("BF2000"))
+
+    log("[2/7] ES9+ InitiateAuthentication")
+    r1 = _es9p(smdp, "initiateAuthentication",
+               {"euiccChallenge": b64e(challenge), "euiccInfo1": b64e(info1),
+                "smdpAddress": smdp})
+    txid = r1["transactionId"]
+
+    log("[3/7] ES10b AuthenticateServer")
+    dev_info = h2b("A108800435290611A100")               # tac + empty capabilities
+    ctx = (tlv([0xA0], tlv([0x80], matching_id.encode()), dev_info)
+           if matching_id else tlv([0xA0], dev_info))
+    auth = await euicc.store_and_read(tlv(
+        [0xBF, 0x38], b64d(r1["serverSigned1"]), b64d(r1["serverSignature1"]),
+        b64d(r1["euiccCiPKIdToBeUsed"]), b64d(r1["serverCertificate"]), ctx))
+    err = _response_error(auth, "BF38")
+    if err is not None:
+        reasons = {"01": "invalid certificate", "02": "invalid signature",
+                   "03": "unsupported curve", "04": "no session context",
+                   "05": "invalid OID", "06": "challenge mismatch",
+                   "07": "CI public key unknown to eUICC"}
+        raise RuntimeError(f"AuthenticateServer rejected (code {err}: {reasons.get(err, '?')})")
+
+    log("[4/7] ES9+ AuthenticateClient")
+    r2 = _es9p(smdp, "authenticateClient",
+               {"transactionId": txid, "authenticateServerResponse": b64e(auth)})
+    meta = _profile_meta(b64d(r2["profileMetadata"]))
+    log("      profile: " + json.dumps(meta, ensure_ascii=False))
+
+    log("[5/7] ES10b PrepareDownload")
+    pd = [b64d(r2["smdpSigned2"]), b64d(r2["smdpSignature2"])]
+    if confirm_code:
+        import hashlib
+        cc = hashlib.sha256(confirm_code.encode()).hexdigest()
+        pd.append(tlv([0x04], hashlib.sha256(bytes.fromhex(cc + txid)).digest()))
+    pd.append(b64d(r2["smdpCertificate"]))
+    pd_resp = await euicc.store_and_read(tlv([0xBF, 0x21], *pd))
+    err = _response_error(pd_resp, "BF21")
+    if err is not None:
+        raise RuntimeError(f"PrepareDownload rejected (code {err}; confirmation code?)")
+
+    log("[6/7] ES9+ GetBoundProfilePackage")
+    r3 = _es9p(smdp, "getBoundProfilePackage",
+               {"transactionId": txid, "prepareDownloadResponse": b64e(pd_resp)})
+    blocks = _bpp_to_blocks(b64d(r3["boundProfilePackage"]))
+
+    log(f"[7/7] ES10b LoadBoundProfilePackage ({len(blocks)} blocks)")
+    result = None
+    for i, blk in enumerate(blocks):
+        r = await euicc.store_bytes(blk)
+        if r and r[0] == 0x61:
+            result = await euicc.get_response(r[1])
+            break
+        if not (r and r[0] == 0x90):
+            raise RuntimeError(f"LoadBPP failed at block {i+1}/{len(blocks)}: {b2h(r)}")
+
+    profiles = await sim.get_profiles()
+    got = next((p for p in profiles if p.get("iccid") == meta.get("iccid")), None)
+    if got is None:
+        raise RuntimeError("LoadBPP finished but the ICCID isn't in the profile "
+                           "list; result: " + (b2h(result) if result else "(none)"))
+    log("OK — installed (disabled): " + json.dumps(got, ensure_ascii=False))
+    return got
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 async def _run(args):
@@ -623,6 +797,15 @@ async def _run(args):
         elif args.command == "apdu":
             resp = await euicc.send_command(h2b(args.hex))
             print(b2h(resp))
+        elif args.command == "download":
+            smdp, matching_id, cc_req = parse_activation_code(args.code)
+            if cc_req and not args.confirm_code:
+                print("note: activation code marks a confirmation code as required "
+                      "(--confirm-code); trying anyway.", file=sys.stderr)
+            try:
+                await download_profile(sim, euicc, smdp, matching_id, args.confirm_code)
+            except Exception as exc:  # noqa: BLE001 — expected server/card errors
+                print(f"Download failed: {exc}", file=sys.stderr)
     finally:
         await client.disconnect()
 
@@ -755,6 +938,7 @@ def _build_tui_app():
             Binding("d", "disable", "Disable"),
             Binding("x", "delete", "Delete"),
             Binding("n", "rename", "Rename"),
+            Binding("o", "download", "Download"),
             Binding("i", "info", "Info"),
             Binding("N", "notifications", "Notifs"),
             Binding("t", "txpower", "TX Power"),
@@ -784,6 +968,7 @@ def _build_tui_app():
                     yield Static("", id="devname")
                     yield Button("Scan & Connect", id="btn-scan", variant="success")
                     yield Button("Refresh", id="btn-refresh", variant="primary")
+                    yield Button("Download eSIM", id="btn-download", variant="success")
                     yield Button("Enable", id="btn-enable")
                     yield Button("Disable", id="btn-disable")
                     yield Button("Delete", id="btn-delete", variant="error")
@@ -848,8 +1033,8 @@ def _build_tui_app():
             self.query_one("#log", RichLog).write(f"[dim]{msg}[/dim]")
 
         def _set_buttons(self, connected: bool) -> None:
-            for bid in ("btn-refresh", "btn-enable", "btn-disable", "btn-delete",
-                        "btn-rename", "btn-txpower", "btn-reset"):
+            for bid in ("btn-refresh", "btn-download", "btn-enable", "btn-disable",
+                        "btn-delete", "btn-rename", "btn-txpower", "btn-reset"):
                 self.query_one(f"#{bid}", Button).disabled = not connected
 
         def _status(self, text: str, ok: bool) -> None:
@@ -883,6 +1068,7 @@ def _build_tui_app():
                 "btn-scan": self.action_scan, "btn-refresh": self.action_refresh,
                 "btn-enable": self.action_enable, "btn-disable": self.action_disable,
                 "btn-delete": self.action_delete, "btn-rename": self.action_rename,
+                "btn-download": self.action_download,
                 "btn-txpower": self.action_txpower, "btn-reset": self.action_reset,
             }
             act = actions.get(event.button.id)
@@ -1075,6 +1261,37 @@ def _build_tui_app():
             finally:
                 self.busy = False
 
+        def action_download(self) -> None:
+            if not self._guard():
+                return
+
+            def done(code: str | None) -> None:
+                if code:
+                    self._download_worker(code)
+
+            self.push_screen(InputScreen(
+                "Download eSIM — activation code / QR:",
+                "LPA:1$rsp.example.com$MATCHING-ID"), done)
+
+        @work(exclusive=True)
+        async def _download_worker(self, code: str) -> None:
+            self.busy = True
+            try:
+                smdp, matching_id, cc_req = parse_activation_code(code)
+                if cc_req:
+                    self.log_line("[yellow]note: code marks a confirmation code as "
+                                  "required; trying without (use the CLI --confirm-code "
+                                  "if it fails).[/yellow]")
+                got = await download_profile(self.sim, self.euicc, smdp, matching_id,
+                                             log=self.log_line)
+                self.log_line("[green]✅ downloaded (disabled):[/green] "
+                              f"{got.get('profileName','')} [{got.get('iccid')}]")
+                await self._load_profiles()
+            except Exception as exc:  # noqa: BLE001
+                self.log_line(f"[red]Download failed:[/red] {exc}")
+            finally:
+                self.busy = False
+
         def action_info(self) -> None:
             if self._guard():
                 self._info_worker()
@@ -1194,6 +1411,9 @@ def main():
     sp.add_argument("level", type=int, choices=range(5))
     sub.add_parser("notifications")
     sp = sub.add_parser("apdu"); sp.add_argument("hex")
+    sp = sub.add_parser("download", help="download an eSIM (LPA activation code / QR)")
+    sp.add_argument("code", help="LPA:1$smdp$matchingId  (or a bare 1$smdp$matchingId)")
+    sp.add_argument("--confirm-code", dest="confirm_code")
     args = p.parse_args()
 
     # No sub-command (or an explicit `tui`) -> launch the terminal UI.
