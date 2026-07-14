@@ -367,4 +367,4 @@ APDUs — it could not be exercised, and nothing is wired in.
 | `beesim.py` | single-file pure-BLE controller: transport + eUICC + ES10 + CLI + Textual TUI |
 | `README.md` | this document |
 | `requirements.txt` | `bleak` (+ `textual` for the TUI) |
-| `assets/`, `src/`, `beauty-*.js` | the downloaded + de-minified web sources |
+| `assets/`, `src/`, `index.html` | the downloaded web-app sources (raw JS chunks) |
