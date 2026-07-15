@@ -166,7 +166,6 @@ essentially useless; it caused numerous operational problems. This feature will
 not be added in future versions."
 
 For existing users, I recommend **lowering the BLE TX power to 0** (see above).
----
 
 ## Protocol reference (reverse-engineered)
 
