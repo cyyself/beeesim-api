@@ -159,12 +159,13 @@ non-recoverable denial of service, with no authentication required.
 
 ### Responsible disclosure
 
-This issue has been **reported to the vendor (BeeSIM)** by the card owner, and a
-response is pending as of **2026-07-14**. This repository documents the owner's
-own testing of their own card for defensive purposes; it intentionally ships no
-profile-download or PIN-bypass tooling. Please do not use it against cards you do
-not own. This section will be updated when the vendor responds or issues a fix.
+This issue has been **reported to the vendor (BeeSIM)** by the card owner, but
+they said their hardware does not support to turn off Bluetooth. For the
+bluetooth-PIN, they said "The PIN code feature has been removed and was
+essentially useless; it caused numerous operational problems. This feature will
+not be added in future versions."
 
+For existing users, I recommend **lowering the BLE TX power to 0** (see above).
 ---
 
 ## Protocol reference (reverse-engineered)
